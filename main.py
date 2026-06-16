@@ -7,19 +7,20 @@ import random
 import math
 
 class ESP32SerialReader:
-    """Handles bidirectional serial communication with the ESP32."""
     def __init__(self, port='/dev/cu.usbserial-210', baudrate=115200):
         self.port = port
         self.baudrate = baudrate
         self.serial_port = None
-        self.latest_input = None
+        # 【修正核心】改用 List 佇列，保證 A1 和 A2 同時進來時不會互相覆蓋！
+        self.input_queue = [] 
         self.is_running = True
+        self.lock = threading.Lock()
         
         try:
-            self.serial_port = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            print(f"[INFO] Successfully connected to ESP32 on {self.port}")
+            self.serial_port = serial.Serial(self.port, self.baudrate, timeout=0.05)
+            print(f"[INFO] Successfully connected to B1 on {self.port}")
         except Exception as e:
-            print(f"[ERROR] Failed to connect to ESP32: {e}")
+            print(f"[ERROR] Failed to connect: {e}")
             sys.exit(1)
 
     def start_reading(self):
@@ -32,60 +33,69 @@ class ESP32SerialReader:
                 try:
                     line = self.serial_port.readline().decode('utf-8').strip()
                     if line:
-                        self.latest_input = line
+                        with self.lock:
+                            # 把所有讀到的按鈕訊號塞進隊伍裡排隊
+                            self.input_queue.append(line)
                 except Exception as e:
-                    print(f"[WARNING] Error reading serial data: {e}")
+                    pass
+            time.sleep(0.001)
 
-    def get_latest_input(self):
-        temp = self.latest_input
-        self.latest_input = None
-        return temp
+    def pop_inputs(self):
+        """一次性倒出目前排隊的所有按鈕訊號"""
+        with self.lock:
+            temp = list(self.input_queue)
+            self.input_queue.clear()
+            return temp
 
     def send_command(self, cmd_char):
         if self.serial_port and self.serial_port.is_open:
             try:
                 self.serial_port.write(cmd_char.encode('utf-8'))
             except Exception as e:
-                print(f"[ERROR] Master write pipeline failed: {e}")
+                print(f"[ERROR] Master write failed: {e}")
 
     def close(self):
         self.is_running = False
         if self.serial_port:
-            self.send_command('X')
+            self.send_command('X') 
             self.serial_port.close()
 
-
 class MemoryGame:
-    """
-    Advanced Cognitive Evaluator.
-    Implements hardware visual exclusion, keeping physical LEDs OFF during display phase,
-    lighting both up during input phase, and triggering a strict 1-second system cooldown on press.
-    """
     def __init__(self):
         pygame.init()
         self.screen_width = 800
         self.screen_height = 600
         self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-        pygame.display.set_caption("Adaptive Cognitive Evaluator - Cooldown Edition")
+        pygame.display.set_caption("Adaptive Cognitive Evaluator - Wireless Edition")
         
         self.clock = pygame.time.Clock()
         self.fps = 60
         self.running = True
-        
-        # --- ADJUSTABLE PARAMETER FOR TESTING ---
-        self.sleep_score = 75  
-        # ----------------------------------------
+        self.sleep_score = 70  
         
         self.COLOR_BG_DEFAULT = (15, 15, 18)
         self.COLOR_BG_DISTORTED = (35, 30, 38) 
         self.current_bg = self.COLOR_BG_DEFAULT
         self.COLOR_WHITE = (240, 240, 242)
         
-        self.RGB_GREEN = (0, 255, 128)  
-        self.RGB_BLUE = (0, 191, 255)   
-        self.RGB_CENTER = (200, 200, 200)
+        self.COLORS_MAP = {
+            "A1": {"name": "PURPLE", "rgb": (186, 85, 211), "pos": (250, 160)},
+            "A2": {"name": "YELLOW", "rgb": (255, 215, 0),  "pos": (550, 160)},
+            "B1": {"name": "GREEN",  "rgb": (0, 255, 128),  "pos": (200, 300)},
+            "B2": {"name": "BLUE",   "rgb": (30, 144, 255), "pos": (600, 300)},
+            "C1": {"name": "RED",    "rgb": (255, 50, 50),  "pos": (250, 440)},
+            "C2": {"name": "WHITE",  "rgb": (240, 240, 255),"pos": (550, 440)}
+        }
         
-        # Game States
+        self.CMD_MAP = {
+            "A1": ('0', '1'), "A2": ('2', '3'),
+            "B1": ('4', '5'), "B2": ('6', '7'),
+            "C1": ('8', '9'), "C2": ('A', 'B')
+        }
+        
+        self.glow_states = {key: {"radius": 0, "alpha": 0} for key in self.COLORS_MAP.keys()}
+        self.max_glow_radius = 110
+        
         self.STATE_START_SCREEN = 0
         self.STATE_GENERATE_SEQUENCE = 1
         self.STATE_FLASH_SEQUENCE = 2
@@ -105,25 +115,21 @@ class MemoryGame:
         self.is_blank_period = False
         self.center_alpha = 0      
         
-        # Cooldown & Visual Exclusion System States
         self.is_in_cooldown = False
         self.cooldown_start_time = 0
-        self.cooldown_duration = 1.0  # Strict 1-second cooldown for buttons and LEDs
-        self.input_phase_initialized = False # Flag to turn both LEDs ON once when entering input state
+        self.cooldown_duration = 1.0  
+        self.active_cooldown_node = None 
+        self.input_phase_initialized = False 
         
+        self.fog_density = 0       
+        self.glitch_active = False 
         self.flicker_active = False
         self.flicker_frequency = 0  
         self.frame_count = 0
         
-        self.left_glow_radius = 0
-        self.left_glow_alpha = 0
-        self.right_glow_radius = 0
-        self.right_glow_alpha = 0
-        self.max_glow_radius = 120  
-        
-        self.b1_last_pressed_time = 0
-        self.b2_last_pressed_time = 0
-        self.sync_window = 0.2  
+        self.a1_last_pressed_time = 0
+        self.a2_last_pressed_time = 0
+        self.sync_window = 0.4  # 放寬時間窗至 0.4 秒，確保雙擊絕對能被判定！
         
         self.font_large = pygame.font.SysFont("Helvetica", 36)
         self.font_small = pygame.font.SysFont("Helvetica", 20)
@@ -145,91 +151,100 @@ class MemoryGame:
                 self.running = False
 
     def update_game_logic(self):
-        hardware_input = self.esp32.get_latest_input()
         current_time = time.time()
         self.frame_count += 1
         
-        input_triggered = None
+        # 倒出排隊中的所有硬體輸入
+        hardware_inputs = self.esp32.pop_inputs()
         
-        # Intercept inputs only if the system is NOT locked down by a cooldown
-        if not self.is_in_cooldown and self.game_state == self.STATE_PLAYER_INPUT:
-            if hardware_input == "B1":    # Left Pressed (Green)
-                input_triggered = "GREEN"
-                self.b1_last_pressed_time = current_time
-                self.left_glow_radius = 50
-                self.left_glow_alpha = 200
-                
-                # Turn OFF physical Green LED instantly on press and start cooldown
-                self.esp32.send_command('g')
-                self.is_in_cooldown = True
-                self.cooldown_start_time = current_time
-                
-            elif hardware_input == "B2":  # Right Pressed (Blue)
-                input_triggered = "BLUE"
-                self.b2_last_pressed_time = current_time
-                self.right_glow_radius = 50
-                self.right_glow_alpha = 200
-                
-                # Turn OFF physical Blue LED instantly on press and start cooldown
-                self.esp32.send_command('b')
-                self.is_in_cooldown = True
-                self.cooldown_start_time = current_time
-        
-        # Global tracker for synchronous start triggers (usable on menu and game over screens)
-        if (self.game_state == self.STATE_START_SCREEN or self.game_state == self.STATE_GAME_OVER):
-            if hardware_input == "B1": self.b1_last_pressed_time = current_time
-            elif hardware_input == "B2": self.b2_last_pressed_time = current_time
+        # 掃描這一個 Frame 裡所有進來的按鈕
+        for inp in hardware_inputs:
+            if inp == "A1": self.a1_last_pressed_time = current_time
+            elif inp == "A2": self.a2_last_pressed_time = current_time
             
-        both_buttons_held = (current_time - self.b1_last_pressed_time < self.sync_window) and \
-                             (current_time - self.b2_last_pressed_time < self.sync_window)
+            # 答題階段的按鍵邏輯
+            if not self.is_in_cooldown and self.game_state == self.STATE_PLAYER_INPUT:
+                if inp in self.COLORS_MAP:
+                    self.player_sequence.append(inp)
+                    self.glow_states[inp]["radius"] = 45
+                    self.glow_states[inp]["alpha"] = 200
+                    
+                    # 隔空無線關燈鎖定
+                    self.esp32.send_command(self.CMD_MAP[inp][0])
+                    
+                    self.is_in_cooldown = True
+                    self.cooldown_start_time = current_time
+                    self.active_cooldown_node = inp
+                    
+                    # 檢查答案
+                    current_step = len(self.player_sequence) - 1
+                    if self.player_sequence[current_step] == self.target_sequence[current_step]:
+                        if len(self.player_sequence) == len(self.target_sequence):
+                            self.score = self.max_score
+                            self.esp32.send_command('X') 
+                            self.game_state = self.STATE_GAME_OVER
+                    else:
+                        self.score = current_step
+                        self.esp32.send_command('X') 
+                        self.game_state = self.STATE_GAME_OVER
+                    break # 一個 Frame 只處理一個有效答題
 
-        # Handle screen visual glow animations
-        if self.left_glow_alpha > 0:
-            self.left_glow_radius += 3  
-            self.left_glow_alpha = max(0, self.left_glow_alpha - 8)  
-        if self.right_glow_alpha > 0:
-            self.right_glow_radius += 3
-            self.right_glow_alpha = max(0, self.right_glow_alpha - 8)
+        # 判定雙擊啟動/重置
+        both_top_buttons_held = (current_time - self.a1_last_pressed_time < self.sync_window) and \
+                                 (current_time - self.a2_last_pressed_time < self.sync_window)
 
-        # --- FSM STATE LOGIC ---
+        # 燈光動態擴散更新
+        for key in self.glow_states:
+            if self.glow_states[key]["alpha"] > 0:
+                self.glow_states[key]["radius"] += 3
+                self.glow_states[key]["alpha"] = max(0, self.glow_states[key]["alpha"] - 8)
+
+        # 釋放冷卻重新亮燈
+        if self.is_in_cooldown:
+            if current_time - self.cooldown_start_time > self.cooldown_duration:
+                self.esp32.send_command(self.CMD_MAP[self.active_cooldown_node][1])
+                self.is_in_cooldown = False
+                self.active_cooldown_node = None
+
+        # --- 狀態機（FSM）管理 ---
         if self.game_state == self.STATE_START_SCREEN:
             self.current_bg = self.COLOR_BG_DEFAULT
-            if both_buttons_held:
-                self.b1_last_pressed_time = 0
-                self.b2_last_pressed_time = 0
+            if both_top_buttons_held:
+                self.a1_last_pressed_time = 0
+                self.a2_last_pressed_time = 0
                 self.score = 0
                 self.is_in_cooldown = False
                 self.input_phase_initialized = False
-                self.esp32.send_command('X') # Ensure LEDs are completely OFF during initialization
+                self.esp32.send_command('X') 
                 self.game_state = self.STATE_GENERATE_SEQUENCE
                 time.sleep(0.4)
 
         elif self.game_state == self.STATE_GENERATE_SEQUENCE:
-            self.target_sequence = [random.choice(["BLUE", "GREEN"]) for _ in range(self.max_score)]
-            print(f"[GAME] Target Sequence: {self.target_sequence}")
+            all_keys = list(self.COLORS_MAP.keys())
+            self.target_sequence = [random.choice(all_keys) for _ in range(self.max_score)]
+            print(f"[GAME] Target Sequence: {[self.COLORS_MAP[k]['name'] for k in self.target_sequence]}")
             self.player_sequence = []
             self.flash_index = 0
             self.flash_start_time = current_time
             self.is_blank_period = False
             
-            # Difficulty calculations
             score_factor = self.sleep_score / 100.0
             self.flash_duration = 0.4 + (1.1 * score_factor)
             self.flash_gap = 0.3 + (0.3 * score_factor)
+            self.fog_density = int((1.0 - score_factor) * 140)
             
             if self.sleep_score < 50:
+                self.glitch_active = True
                 self.flicker_active = True
                 self.flicker_frequency = 4 if self.sleep_score < 25 else 8
             else:
+                self.glitch_active = False
                 self.flicker_active = False
                 
             self.game_state = self.STATE_FLASH_SEQUENCE
 
         elif self.game_state == self.STATE_FLASH_SEQUENCE:
             elapsed = current_time - self.flash_start_time
-            
-            # Physical LEDs are kept forced OFF ('X') during the entire display phase
-            # Screen noise flickering for fatigue emulation
             if self.flicker_active:
                 if self.frame_count % self.flicker_frequency == 0:
                     self.current_bg = self.COLOR_BG_DISTORTED if self.current_bg == self.COLOR_BG_DEFAULT else self.COLOR_BG_DEFAULT
@@ -241,7 +256,6 @@ class MemoryGame:
                     progress = elapsed / self.flash_duration
                     self.center_alpha = int(math.sin(progress * math.pi) * 255)
                     self.center_alpha = max(0, min(255, self.center_alpha))
-                    
                     if elapsed > self.flash_duration:
                         self.is_blank_period = True
                         self.flash_start_time = current_time
@@ -258,41 +272,14 @@ class MemoryGame:
                 self.game_state = self.STATE_PLAYER_INPUT
 
         elif self.game_state == self.STATE_PLAYER_INPUT:
-            # Step A: Initialize Input Phase - Turn BOTH physical LEDs ON once
             if not self.input_phase_initialized:
-                self.esp32.send_command('G')
-                self.esp32.send_command('B')
+                self.esp32.send_command('Y') # 唰地一聲無線全亮！
                 self.input_phase_initialized = True
-                print("[SYS] Input Mode Active: Both physical indicators illuminated.")
-
-            # Step B: Cooldown Management Loop
-            if self.is_in_cooldown:
-                if current_time - self.cooldown_start_time > self.cooldown_duration:
-                    # Cooldown ended! Re-illuminate both indicators and unlock buttons
-                    self.esp32.send_command('G')
-                    self.esp32.send_command('B')
-                    self.is_in_cooldown = False
-                    print("[SYS] Cooldown expired. Peripheral locks released.")
-
-            # Step C: Validate user input history sequence
-            if input_triggered:
-                self.player_sequence.append(input_triggered)
-                current_step = len(self.player_sequence) - 1
-                
-                if self.player_sequence[current_step] == self.target_sequence[current_step]:
-                    if len(self.player_sequence) == len(self.target_sequence):
-                        self.score = self.max_score
-                        self.esp32.send_command('X') # Extinguish everything on success
-                        self.game_state = self.STATE_GAME_OVER
-                else:
-                    self.score = current_step
-                    self.esp32.send_command('X') # Extinguish everything on failure
-                    self.game_state = self.STATE_GAME_OVER
 
         elif self.game_state == self.STATE_GAME_OVER:
-            if both_buttons_held:
-                self.b1_last_pressed_time = 0
-                self.b2_last_pressed_time = 0
+            if both_top_buttons_held:
+                self.a1_last_pressed_time = 0
+                self.a2_last_pressed_time = 0
                 self.game_state = self.STATE_START_SCREEN
                 time.sleep(0.4)
 
@@ -304,60 +291,53 @@ class MemoryGame:
     def render(self):
         self.screen.fill(self.current_bg)
         
-        # 1. Render Ambient Background Layout Buttons
-        self.draw_transparent_circle(self.RGB_GREEN, 40, (220, 300), 50, width=3)
-        self.draw_transparent_circle(self.RGB_GREEN, 15, (220, 300), 47)
-        self.draw_transparent_circle(self.RGB_BLUE, 40, (580, 300), 50, width=3)
-        self.draw_transparent_circle(self.RGB_BLUE, 15, (580, 300), 47)
-        self.draw_transparent_circle(self.RGB_CENTER, 30, (400, 300), 65, width=2)
+        for key, data in self.COLORS_MAP.items():
+            pos = data["pos"]
+            rgb = data["rgb"]
+            self.draw_transparent_circle(rgb, 45, pos, 45, width=3)
+            self.draw_transparent_circle(rgb, 15, pos, 42)
+            
+        self.draw_transparent_circle((200, 200, 200), 30, (400, 300), 65, width=2)
 
-        # 2. Render Dynamic Light Leaks
-        if self.left_glow_alpha > 0 and self.left_glow_radius < self.max_glow_radius:
-            self.draw_transparent_circle(self.RGB_GREEN, self.left_glow_alpha, (220, 300), self.left_glow_radius, width=4)
-        if self.right_glow_alpha > 0 and self.right_glow_radius < self.max_glow_radius:
-            self.draw_transparent_circle(self.RGB_BLUE, self.right_glow_alpha, (580, 300), self.right_glow_radius, width=4)
+        for key, glow in self.glow_states.items():
+            if glow["alpha"] > 0 and glow["radius"] < self.max_glow_radius:
+                pos = self.COLORS_MAP[key]["pos"]
+                rgb = self.COLORS_MAP[key]["rgb"]
+                self.draw_transparent_circle(rgb, glow["alpha"], pos, glow["radius"], width=4)
 
-        # 3. Render Center Flashing Color Display
         if self.game_state == self.STATE_FLASH_SEQUENCE and not self.is_blank_period:
             if self.flash_index < len(self.target_sequence):
-                active_color_str = self.target_sequence[self.flash_index]
-                target_rgb = self.RGB_BLUE if active_color_str == "BLUE" else self.RGB_GREEN
+                active_key = self.target_sequence[self.flash_index]
+                target_rgb = self.COLORS_MAP[active_key]["rgb"]
                 self.draw_transparent_circle(target_rgb, self.center_alpha, (400, 300), 60)
 
-        # 4. UI Text Overlay Processing
-        txt_sleep_info = self.font_small.render(f"System Load Profile: Sleep Score [{self.sleep_score}]", True, (120, 120, 130))
+        txt_sleep_info = self.font_small.render(f"System Profile: Sleep Score [{self.sleep_score}]", True, (120, 120, 130))
         self.screen.blit(txt_sleep_info, (20, 20))
         
-        # Cooldown UI Feedback lock notification
         if self.game_state == self.STATE_PLAYER_INPUT and self.is_in_cooldown:
-            txt_lock = self.font_small.render("[PERIPHERAL COOLDOWN ACTIVE - CHANNELS LOCKED]", True, (255, 100, 100))
-            self.screen.blit(txt_lock, (220, 530))
+            txt_lock = self.font_small.render("[HARDWARE LOCKOUT - RE-ARMING PIPELINE]", True, (255, 100, 100))
+            self.screen.blit(txt_lock, (240, 540))
 
         if self.game_state == self.STATE_START_SCREEN:
-            txt_title = self.font_large.render("Cognitive Skill Evaluator", True, self.COLOR_WHITE)
-            txt_prompt = self.font_small.render("Press BOTH physical buttons to initialize test", True, self.COLOR_WHITE)
-            self.screen.blit(txt_title, (240, 120))
-            self.screen.blit(txt_prompt, (235, 480))
+            txt_title = self.font_large.render("Cognitive Evaluator (Wireless Standard)", True, self.COLOR_WHITE)
+            txt_prompt = self.font_small.render("Press Top-Left (A1) & Top-Right (A2) to initialize", True, self.COLOR_WHITE)
+            self.screen.blit(txt_title, (160, 220))
+            self.screen.blit(txt_prompt, (200, 320))
             
         elif self.game_state == self.STATE_FLASH_SEQUENCE:
-            txt_watch = self.font_large.render("Observe the Sequence", True, self.COLOR_WHITE)
-            self.screen.blit(txt_watch, (260, 120))
+            txt_watch = self.font_large.render("Observe Sequence", True, self.COLOR_WHITE)
+            self.screen.blit(txt_watch, (280, 220))
             
         elif self.game_state == self.STATE_PLAYER_INPUT:
-            txt_repeat = self.font_large.render("Replicate Inputs from Memory", True, self.COLOR_WHITE)
-            txt_count = self.font_small.render(f"Step Tracker: {len(self.player_sequence)} / {self.max_score}", True, self.COLOR_WHITE)
-            self.screen.blit(txt_repeat, (210, 120))
-            self.screen.blit(txt_count, (340, 480))
+            txt_repeat = self.font_large.render("Replicate Mapped Nodes", True, self.COLOR_WHITE)
+            txt_count = self.font_small.render(f"Progress Matrix: {len(self.player_sequence)} / {self.max_score}", True, self.COLOR_WHITE)
+            self.screen.blit(txt_repeat, (250, 220))
+            self.screen.blit(txt_count, (330, 320))
             
         elif self.game_state == self.STATE_GAME_OVER:
-            msg = "PERFORMANCE OPTIMAL" if self.score == self.max_score else "EVALUATION TERMINATED"
+            msg = "EVALUATION OPTIMAL" if self.score == self.max_score else "EVALUATION TERMINATED"
             txt_status = self.font_large.render(msg, True, self.COLOR_WHITE)
-            txt_final = self.font_small.render(f"Calculated Score metrics: {self.score} / {self.max_score}", True, self.COLOR_WHITE)
-            txt_restart = self.font_small.render("Synchronize BOTH buttons to restart system", True, self.COLOR_WHITE)
-            
-            self.screen.blit(txt_status, (230 if self.score == self.max_score else 220, 120))
-            self.screen.blit(txt_final, (300, 290))
-            self.screen.blit(txt_restart, (245, 480))
+            self.screen.blit(txt_status, (240 if self.score == self.max_score else 225, 200))
             
         pygame.display.flip()
 
