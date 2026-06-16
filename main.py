@@ -7,7 +7,7 @@ import random
 import math
 
 class ESP32SerialReader:
-    """Handles background serial communication with the ESP32."""
+    """Handles bidirectional serial communication with the ESP32."""
     def __init__(self, port='/dev/cu.usbserial-210', baudrate=115200):
         self.port = port
         self.baudrate = baudrate
@@ -41,34 +41,48 @@ class ESP32SerialReader:
         self.latest_input = None
         return temp
 
+    def send_command(self, cmd_char):
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write(cmd_char.encode('utf-8'))
+            except Exception as e:
+                print(f"[ERROR] Master write pipeline failed: {e}")
+
     def close(self):
         self.is_running = False
         if self.serial_port:
+            self.send_command('X')
             self.serial_port.close()
 
 
 class MemoryGame:
     """
-    Main game engine with 5-step cognitive sequence evaluation.
-    Utilizes dual hardware buttons and implements smooth visual transitions.
+    Advanced Cognitive Evaluator.
+    Implements hardware visual exclusion, keeping physical LEDs OFF during display phase,
+    lighting both up during input phase, and triggering a strict 1-second system cooldown on press.
     """
     def __init__(self):
         pygame.init()
         self.screen_width = 800
         self.screen_height = 600
         self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-        pygame.display.set_caption("Enhanced Cognitive Evaluator - 5-Step Version")
+        pygame.display.set_caption("Adaptive Cognitive Evaluator - Cooldown Edition")
         
         self.clock = pygame.time.Clock()
         self.fps = 60
         self.running = True
         
-        # Color definitions
-        self.COLOR_BG = (15, 15, 18)
+        # --- ADJUSTABLE PARAMETER FOR TESTING ---
+        self.sleep_score = 75  
+        # ----------------------------------------
+        
+        self.COLOR_BG_DEFAULT = (15, 15, 18)
+        self.COLOR_BG_DISTORTED = (35, 30, 38) 
+        self.current_bg = self.COLOR_BG_DEFAULT
         self.COLOR_WHITE = (240, 240, 242)
         
-        self.RGB_GREEN = (0, 255, 128)  # D23 Left
-        self.RGB_BLUE = (0, 191, 255)   # D22 Right
+        self.RGB_GREEN = (0, 255, 128)  
+        self.RGB_BLUE = (0, 191, 255)   
         self.RGB_CENTER = (200, 200, 200)
         
         # Game States
@@ -79,13 +93,11 @@ class MemoryGame:
         self.STATE_GAME_OVER = 4
         self.game_state = self.STATE_START_SCREEN
         
-        # Scoring and logic (Updated max_score to 5)
         self.score = 0
         self.max_score = 5
         self.target_sequence = []  
         self.player_sequence = []  
         
-        # Sequence Timer variables
         self.flash_index = 0
         self.flash_start_time = 0
         self.flash_duration = 1.2  
@@ -93,14 +105,22 @@ class MemoryGame:
         self.is_blank_period = False
         self.center_alpha = 0      
         
-        # Light Leak / Glow Effect System
+        # Cooldown & Visual Exclusion System States
+        self.is_in_cooldown = False
+        self.cooldown_start_time = 0
+        self.cooldown_duration = 1.0  # Strict 1-second cooldown for buttons and LEDs
+        self.input_phase_initialized = False # Flag to turn both LEDs ON once when entering input state
+        
+        self.flicker_active = False
+        self.flicker_frequency = 0  
+        self.frame_count = 0
+        
         self.left_glow_radius = 0
         self.left_glow_alpha = 0
         self.right_glow_radius = 0
         self.right_glow_alpha = 0
         self.max_glow_radius = 120  
         
-        # Simultaneous press windows
         self.b1_last_pressed_time = 0
         self.b2_last_pressed_time = 0
         self.sync_window = 0.2  
@@ -127,23 +147,43 @@ class MemoryGame:
     def update_game_logic(self):
         hardware_input = self.esp32.get_latest_input()
         current_time = time.time()
+        self.frame_count += 1
         
         input_triggered = None
         
-        if hardware_input == "B1":    # D23 Left (Green)
-            input_triggered = "GREEN"
-            self.b1_last_pressed_time = current_time
-            self.left_glow_radius = 50
-            self.left_glow_alpha = 200
-        elif hardware_input == "B2":  # D22 Right (Blue)
-            input_triggered = "BLUE"
-            self.b2_last_pressed_time = current_time
-            self.right_glow_radius = 50
-            self.right_glow_alpha = 200
+        # Intercept inputs only if the system is NOT locked down by a cooldown
+        if not self.is_in_cooldown and self.game_state == self.STATE_PLAYER_INPUT:
+            if hardware_input == "B1":    # Left Pressed (Green)
+                input_triggered = "GREEN"
+                self.b1_last_pressed_time = current_time
+                self.left_glow_radius = 50
+                self.left_glow_alpha = 200
+                
+                # Turn OFF physical Green LED instantly on press and start cooldown
+                self.esp32.send_command('g')
+                self.is_in_cooldown = True
+                self.cooldown_start_time = current_time
+                
+            elif hardware_input == "B2":  # Right Pressed (Blue)
+                input_triggered = "BLUE"
+                self.b2_last_pressed_time = current_time
+                self.right_glow_radius = 50
+                self.right_glow_alpha = 200
+                
+                # Turn OFF physical Blue LED instantly on press and start cooldown
+                self.esp32.send_command('b')
+                self.is_in_cooldown = True
+                self.cooldown_start_time = current_time
+        
+        # Global tracker for synchronous start triggers (usable on menu and game over screens)
+        if (self.game_state == self.STATE_START_SCREEN or self.game_state == self.STATE_GAME_OVER):
+            if hardware_input == "B1": self.b1_last_pressed_time = current_time
+            elif hardware_input == "B2": self.b2_last_pressed_time = current_time
             
         both_buttons_held = (current_time - self.b1_last_pressed_time < self.sync_window) and \
                              (current_time - self.b2_last_pressed_time < self.sync_window)
 
+        # Handle screen visual glow animations
         if self.left_glow_alpha > 0:
             self.left_glow_radius += 3  
             self.left_glow_alpha = max(0, self.left_glow_alpha - 8)  
@@ -153,25 +193,49 @@ class MemoryGame:
 
         # --- FSM STATE LOGIC ---
         if self.game_state == self.STATE_START_SCREEN:
+            self.current_bg = self.COLOR_BG_DEFAULT
             if both_buttons_held:
                 self.b1_last_pressed_time = 0
                 self.b2_last_pressed_time = 0
                 self.score = 0
+                self.is_in_cooldown = False
+                self.input_phase_initialized = False
+                self.esp32.send_command('X') # Ensure LEDs are completely OFF during initialization
                 self.game_state = self.STATE_GENERATE_SEQUENCE
                 time.sleep(0.4)
 
         elif self.game_state == self.STATE_GENERATE_SEQUENCE:
-            # Compiles a randomized 5-step stimulus array
             self.target_sequence = [random.choice(["BLUE", "GREEN"]) for _ in range(self.max_score)]
             print(f"[GAME] Target Sequence: {self.target_sequence}")
             self.player_sequence = []
             self.flash_index = 0
             self.flash_start_time = current_time
             self.is_blank_period = False
+            
+            # Difficulty calculations
+            score_factor = self.sleep_score / 100.0
+            self.flash_duration = 0.4 + (1.1 * score_factor)
+            self.flash_gap = 0.3 + (0.3 * score_factor)
+            
+            if self.sleep_score < 50:
+                self.flicker_active = True
+                self.flicker_frequency = 4 if self.sleep_score < 25 else 8
+            else:
+                self.flicker_active = False
+                
             self.game_state = self.STATE_FLASH_SEQUENCE
 
         elif self.game_state == self.STATE_FLASH_SEQUENCE:
             elapsed = current_time - self.flash_start_time
+            
+            # Physical LEDs are kept forced OFF ('X') during the entire display phase
+            # Screen noise flickering for fatigue emulation
+            if self.flicker_active:
+                if self.frame_count % self.flicker_frequency == 0:
+                    self.current_bg = self.COLOR_BG_DISTORTED if self.current_bg == self.COLOR_BG_DEFAULT else self.COLOR_BG_DEFAULT
+            else:
+                self.current_bg = self.COLOR_BG_DEFAULT
+
             if self.flash_index < len(self.target_sequence):
                 if not self.is_blank_period:
                     progress = elapsed / self.flash_duration
@@ -190,21 +254,39 @@ class MemoryGame:
                         self.flash_start_time = current_time
             
             if self.flash_index >= len(self.target_sequence):
+                self.current_bg = self.COLOR_BG_DEFAULT
                 self.game_state = self.STATE_PLAYER_INPUT
 
         elif self.game_state == self.STATE_PLAYER_INPUT:
+            # Step A: Initialize Input Phase - Turn BOTH physical LEDs ON once
+            if not self.input_phase_initialized:
+                self.esp32.send_command('G')
+                self.esp32.send_command('B')
+                self.input_phase_initialized = True
+                print("[SYS] Input Mode Active: Both physical indicators illuminated.")
+
+            # Step B: Cooldown Management Loop
+            if self.is_in_cooldown:
+                if current_time - self.cooldown_start_time > self.cooldown_duration:
+                    # Cooldown ended! Re-illuminate both indicators and unlock buttons
+                    self.esp32.send_command('G')
+                    self.esp32.send_command('B')
+                    self.is_in_cooldown = False
+                    print("[SYS] Cooldown expired. Peripheral locks released.")
+
+            # Step C: Validate user input history sequence
             if input_triggered:
                 self.player_sequence.append(input_triggered)
                 current_step = len(self.player_sequence) - 1
                 
                 if self.player_sequence[current_step] == self.target_sequence[current_step]:
-                    # Check if the user completed all 5 steps successfully
                     if len(self.player_sequence) == len(self.target_sequence):
                         self.score = self.max_score
+                        self.esp32.send_command('X') # Extinguish everything on success
                         self.game_state = self.STATE_GAME_OVER
                 else:
-                    # Capture partial score achieved before system termination
                     self.score = current_step
+                    self.esp32.send_command('X') # Extinguish everything on failure
                     self.game_state = self.STATE_GAME_OVER
 
         elif self.game_state == self.STATE_GAME_OVER:
@@ -220,7 +302,7 @@ class MemoryGame:
         self.screen.blit(surface, (center[0] - radius, center[1] - radius))
 
     def render(self):
-        self.screen.fill(self.COLOR_BG)
+        self.screen.fill(self.current_bg)
         
         # 1. Render Ambient Background Layout Buttons
         self.draw_transparent_circle(self.RGB_GREEN, 40, (220, 300), 50, width=3)
@@ -242,7 +324,15 @@ class MemoryGame:
                 target_rgb = self.RGB_BLUE if active_color_str == "BLUE" else self.RGB_GREEN
                 self.draw_transparent_circle(target_rgb, self.center_alpha, (400, 300), 60)
 
-        # 4. UI Text Overlay Processing (Configured for 5-Point Cap)
+        # 4. UI Text Overlay Processing
+        txt_sleep_info = self.font_small.render(f"System Load Profile: Sleep Score [{self.sleep_score}]", True, (120, 120, 130))
+        self.screen.blit(txt_sleep_info, (20, 20))
+        
+        # Cooldown UI Feedback lock notification
+        if self.game_state == self.STATE_PLAYER_INPUT and self.is_in_cooldown:
+            txt_lock = self.font_small.render("[PERIPHERAL COOLDOWN ACTIVE - CHANNELS LOCKED]", True, (255, 100, 100))
+            self.screen.blit(txt_lock, (220, 530))
+
         if self.game_state == self.STATE_START_SCREEN:
             txt_title = self.font_large.render("Cognitive Skill Evaluator", True, self.COLOR_WHITE)
             txt_prompt = self.font_small.render("Press BOTH physical buttons to initialize test", True, self.COLOR_WHITE)
