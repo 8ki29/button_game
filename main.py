@@ -1,350 +1,308 @@
 import pygame
 import serial
-import threading
-import sys
-import time
+import serial.tools.list_ports
 import random
+import time
+import sys
 import math
 
-class ESP32SerialReader:
-    def __init__(self, port='/dev/cu.usbserial-210', baudrate=115200):
-        self.port = port
-        self.baudrate = baudrate
-        self.serial_port = None
-        # 【修正核心】改用 List 佇列，保證 A1 和 A2 同時進來時不會互相覆蓋！
-        self.input_queue = [] 
-        self.is_running = True
-        self.lock = threading.Lock()
-        
+# ==========================================
+# 🎮 遊戲與睡眠指標演算法配置
+# ==========================================
+print("=== ACE: Liquid Glass & Motion Trail Sync (Alpha 1.1.0) ===")
+try:
+    sleepiness = int(input("Enter Day-time Sleepiness Score (0-4): ") or "0")
+except: sleepiness = 0
+fog_alpha = int((sleepiness / 4.0) * 150) 
+
+try:
+    memory_score = int(input("Enter Memory Score (0-100): ") or "100")
+except: memory_score = 100
+sequence_length = 9 if memory_score < 50 else 5  
+
+try:
+    attention_score = int(input("Enter Attention Speed Score (0-100): ") or "100")
+except: attention_score = 100
+
+# 🌟 修正點 1：反向速度演算法！分數越高（100）＝ 越慢越容易（0.025）；分數越低（0）＝ 暴衝地獄（0.075）
+flight_speed = 0.075 - (attention_score / 100.0) * 0.050
+
+is_good_sleep = (memory_score + attention_score) / 2 >= 60
+universe_mode = "GOOD_SLEEP" if is_good_sleep else "SLEEP_DEBT"
+
+# Apple 流體光澤色調
+COLOR_RGB = {
+    'PURPLE': (170, 0, 255),   'YELLOW': (255, 230, 0), 'GREEN': (0, 255, 60),
+    'BLUE':   (0, 100, 255),   'RED':    (255, 20, 50), 'WHITE': (240, 245, 255),
+    'DARK_GRAY': (25, 25, 35)
+}
+
+COLOR_POOL = ['GREEN', 'BLUE', 'YELLOW'] if is_good_sleep else ['PURPLE', 'BLUE', 'YELLOW']
+
+def generate_balanced_layout():
+    left_colors = COLOR_POOL.copy()
+    random.shuffle(left_colors)
+    a1_color, b1_color, c1_color = left_colors[0], left_colors[1], left_colors[2]
+    c2_color = b1_color 
+    remaining_for_right = [c for c in COLOR_POOL if c != c2_color]
+    random.shuffle(remaining_for_right)
+    a2_color, b2_color = remaining_for_right[0], remaining_for_right[1]
+    return {'A1': a1_color, 'A2': a2_color, 'B1': b1_color, 'B2': b2_color, 'C1': c1_color, 'C2': c2_color}
+
+GAME_LAYOUT = generate_balanced_layout()
+
+available_nodes = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+if universe_mode == "SLEEP_DEBT":
+    target_nodes = random.choices(available_nodes, k=sequence_length)
+else:
+    target_nodes = random.sample(available_nodes, sequence_length)
+
+target_colors = [GAME_LAYOUT[n] for n in target_nodes]
+
+# ==========================================
+# 🔌 序列埠安全連線
+# ==========================================
+ser = None
+ports = list(serial.tools.list_ports.comports())
+for p in ports:
+    if "usbserial" in p.device or "cu.usbserial" in p.device:
         try:
-            self.serial_port = serial.Serial(self.port, self.baudrate, timeout=0.05)
-            print(f"[INFO] Successfully connected to B1 on {self.port}")
-        except Exception as e:
-            print(f"[ERROR] Failed to connect: {e}")
-            sys.exit(1)
+            ser = serial.Serial(p.device, 115200, timeout=0.01)
+            break
+        except: pass
 
-    def start_reading(self):
-        thread = threading.Thread(target=self._read_loop, daemon=True)
-        thread.start()
+def send_led_command(ser, node_key, color_char):
+    if not ser or not ser.is_open: return
+    node_map = {'A1': '0', 'A2': '1', 'B1': '2', 'B2': '3', 'C1': '4', 'C2': '5'}
+    packet = node_map[node_key] + color_char
+    try: ser.write(packet.encode('ascii')); ser.flush()
+    except: pass
 
-    def _read_loop(self):
-        while self.is_running:
-            if self.serial_port and self.serial_port.in_waiting > 0:
-                try:
-                    line = self.serial_port.readline().decode('utf-8').strip()
-                    if line:
-                        with self.lock:
-                            # 把所有讀到的按鈕訊號塞進隊伍裡排隊
-                            self.input_queue.append(line)
-                except Exception as e:
-                    pass
-            time.sleep(0.001)
+def global_hardware_reset(ser):
+    if not ser or not ser.is_open: return
+    try: ser.write(f"XX".encode('ascii')); ser.flush()
+    except: pass
 
-    def pop_inputs(self):
-        """一次性倒出目前排隊的所有按鈕訊號"""
-        with self.lock:
-            temp = list(self.input_queue)
-            self.input_queue.clear()
-            return temp
+# ==========================================
+# 🖥️ Pygame 初始化與高級字型配置
+# ==========================================
+pygame.init()
+size = (800, 750)
+screen = pygame.display.set_mode(size)
+pygame.display.set_caption("ACE: Liquid Glass Engine")
 
-    def send_command(self, cmd_char):
-        if self.serial_port and self.serial_port.is_open:
-            try:
-                self.serial_port.write(cmd_char.encode('utf-8'))
-            except Exception as e:
-                print(f"[ERROR] Master write failed: {e}")
+font_large = pygame.font.SysFont("Helvetica", 40, bold=True)
+font_sub = pygame.font.SysFont("Helvetica", 20)
+font_core = pygame.font.SysFont("Helvetica", 22, bold=True)
 
-    def close(self):
-        self.is_running = False
-        if self.serial_port:
-            self.send_command('X') 
-            self.serial_port.close()
+NODE_POSITIONS = {
+    'A1': (150, 120), 'A2': (650, 120),
+    'B1': (90, 360),  'B2': (710, 360),
+    'C1': (150, 600), 'C2': (650, 600)
+}
+CENTER_CORE_POS = (400, 360)
 
-class MemoryGame:
-    def __init__(self):
-        pygame.init()
-        self.screen_width = 800
-        self.screen_height = 600
-        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-        pygame.display.set_caption("Adaptive Cognitive Evaluator - Wireless Edition")
-        
-        self.clock = pygame.time.Clock()
-        self.fps = 60
-        self.running = True
-        self.sleep_score = 70  
-        
-        self.COLOR_BG_DEFAULT = (15, 15, 18)
-        self.COLOR_BG_DISTORTED = (35, 30, 38) 
-        self.current_bg = self.COLOR_BG_DEFAULT
-        self.COLOR_WHITE = (240, 240, 242)
-        
-        self.COLORS_MAP = {
-            "A1": {"name": "PURPLE", "rgb": (186, 85, 211), "pos": (250, 160)},
-            "A2": {"name": "YELLOW", "rgb": (255, 215, 0),  "pos": (550, 160)},
-            "B1": {"name": "GREEN",  "rgb": (0, 255, 128),  "pos": (200, 300)},
-            "B2": {"name": "BLUE",   "rgb": (30, 144, 255), "pos": (600, 300)},
-            "C1": {"name": "RED",    "rgb": (255, 50, 50),  "pos": (250, 440)},
-            "C2": {"name": "WHITE",  "rgb": (240, 240, 255),"pos": (550, 440)}
-        }
-        
-        self.CMD_MAP = {
-            "A1": ('0', '1'), "A2": ('2', '3'),
-            "B1": ('4', '5'), "B2": ('6', '7'),
-            "C1": ('8', '9'), "C2": ('A', 'B')
-        }
-        
-        self.glow_states = {key: {"radius": 0, "alpha": 0} for key in self.COLORS_MAP.keys()}
-        self.max_glow_radius = 110
-        
-        self.STATE_START_SCREEN = 0
-        self.STATE_GENERATE_SEQUENCE = 1
-        self.STATE_FLASH_SEQUENCE = 2
-        self.STATE_PLAYER_INPUT = 3
-        self.STATE_GAME_OVER = 4
-        self.game_state = self.STATE_START_SCREEN
-        
-        self.score = 0
-        self.max_score = 5
-        self.target_sequence = []  
-        self.player_sequence = []  
-        
-        self.flash_index = 0
-        self.flash_start_time = 0
-        self.flash_duration = 1.2  
-        self.flash_gap = 0.5       
-        self.is_blank_period = False
-        self.center_alpha = 0      
-        
-        self.is_in_cooldown = False
-        self.cooldown_start_time = 0
-        self.cooldown_duration = 1.0  
-        self.active_cooldown_node = None 
-        self.input_phase_initialized = False 
-        
-        self.fog_density = 0       
-        self.glitch_active = False 
-        self.flicker_active = False
-        self.flicker_frequency = 0  
-        self.frame_count = 0
-        
-        self.a1_last_pressed_time = 0
-        self.a2_last_pressed_time = 0
-        self.sync_window = 0.4  # 放寬時間窗至 0.4 秒，確保雙擊絕對能被判定！
-        
-        self.font_large = pygame.font.SysFont("Helvetica", 36)
-        self.font_small = pygame.font.SysFont("Helvetica", 20)
-        
-        self.esp32 = ESP32SerialReader(port='/dev/cu.usbserial-210', baudrate=115200)
+KEY_NODE_MAP = {
+    pygame.K_1: 'A1', pygame.K_2: 'A2',
+    pygame.K_3: 'B1', pygame.K_4: 'B2',
+    pygame.K_5: 'C1', pygame.K_6: 'C2'
+}
 
-    def run(self):
-        self.esp32.start_reading()
-        while self.running:
-            self.handle_events()
-            self.update_game_logic()
-            self.render()
-            self.clock.tick(self.fps)
-        self.cleanup()
+game_state = 0  
+player_index = 0
+current_led_states = {k: False for k in available_nodes} 
+global_hardware_reset(ser)
 
-    def handle_events(self):
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.running = False
+flash_idx = 0
+anim_t = 0.0
+is_ball_flying = False
+ball_current_pos = list(CENTER_CORE_POS)
 
-    def update_game_logic(self):
-        current_time = time.time()
-        self.frame_count += 1
+# 🌟 修正點 2：新增殘影尾跡陣列，用來記錄過去的軌跡位置，達成流體流線感
+ball_history = [] 
+
+def draw_liquid_glass_sphere(surface, center, radius, color, base_alpha=120):
+    """高端多層次高斯發光疊加"""
+    for r in range(radius, 0, -3):
+        alpha = int(base_alpha * (1.0 - (r / radius) ** 1.5))
+        if alpha <= 0: alpha = 1
+        glow_surf = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
+        pygame.draw.circle(glow_surf, color + (alpha,), (r, r), r)
+        surface.blit(glow_surf, (center[0] - r, center[1] - r))
+
+clock = pygame.time.Clock()
+running = True
+
+while running:
+    pulse_factor = (math.sin(pygame.time.get_ticks() * 0.004) + 1.0) / 2.0  
+    
+    if ser and ser.is_open and ser.in_waiting > 0:
+        raw_line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if raw_line == "DOUBLE" and game_state == 0:
+            game_state = 1; flash_idx = 0; anim_t = 0.0; is_ball_flying = True; ball_history.clear()
+        elif game_state == 2 and raw_line in available_nodes:
+            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=None, unicode=raw_line))
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT: running = False
         
-        # 倒出排隊中的所有硬體輸入
-        hardware_inputs = self.esp32.pop_inputs()
-        
-        # 掃描這一個 Frame 裡所有進來的按鈕
-        for inp in hardware_inputs:
-            if inp == "A1": self.a1_last_pressed_time = current_time
-            elif inp == "A2": self.a2_last_pressed_time = current_time
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_SPACE and game_state == 0:
+                print("[SYS] Motion Trigger Activated! Launching Neural Sequence...")
+                game_state = 1; flash_idx = 0; anim_t = 0.0; is_ball_flying = True; ball_history.clear()
             
-            # 答題階段的按鍵邏輯
-            if not self.is_in_cooldown and self.game_state == self.STATE_PLAYER_INPUT:
-                if inp in self.COLORS_MAP:
-                    self.player_sequence.append(inp)
-                    self.glow_states[inp]["radius"] = 45
-                    self.glow_states[inp]["alpha"] = 200
-                    
-                    # 隔空無線關燈鎖定
-                    self.esp32.send_command(self.CMD_MAP[inp][0])
-                    
-                    self.is_in_cooldown = True
-                    self.cooldown_start_time = current_time
-                    self.active_cooldown_node = inp
-                    
-                    # 檢查答案
-                    current_step = len(self.player_sequence) - 1
-                    if self.player_sequence[current_step] == self.target_sequence[current_step]:
-                        if len(self.player_sequence) == len(self.target_sequence):
-                            self.score = self.max_score
-                            self.esp32.send_command('X') 
-                            self.game_state = self.STATE_GAME_OVER
-                    else:
-                        self.score = current_step
-                        self.esp32.send_command('X') 
-                        self.game_state = self.STATE_GAME_OVER
-                    break # 一個 Frame 只處理一個有效答題
+            if event.key == pygame.K_7 and game_state == 0:
+                universe_mode = "SLEEP_DEBT" if universe_mode == "GOOD_SLEEP" else "GOOD_SLEEP"
+                print(f"[CHEAT] Universe swapped to: {universe_mode}")
+                GAME_LAYOUT = generate_balanced_layout()
+                target_nodes = random.choices(available_nodes, k=sequence_length) if universe_mode == "SLEEP_DEBT" else random.sample(available_nodes, sequence_length)
+                target_colors = [GAME_LAYOUT[n] for n in target_nodes]
 
-        # 判定雙擊啟動/重置
-        both_top_buttons_held = (current_time - self.a1_last_pressed_time < self.sync_window) and \
-                                 (current_time - self.a2_last_pressed_time < self.sync_window)
-
-        # 燈光動態擴散更新
-        for key in self.glow_states:
-            if self.glow_states[key]["alpha"] > 0:
-                self.glow_states[key]["radius"] += 3
-                self.glow_states[key]["alpha"] = max(0, self.glow_states[key]["alpha"] - 8)
-
-        # 釋放冷卻重新亮燈
-        if self.is_in_cooldown:
-            if current_time - self.cooldown_start_time > self.cooldown_duration:
-                self.esp32.send_command(self.CMD_MAP[self.active_cooldown_node][1])
-                self.is_in_cooldown = False
-                self.active_cooldown_node = None
-
-        # --- 狀態機（FSM）管理 ---
-        if self.game_state == self.STATE_START_SCREEN:
-            self.current_bg = self.COLOR_BG_DEFAULT
-            if both_top_buttons_held:
-                self.a1_last_pressed_time = 0
-                self.a2_last_pressed_time = 0
-                self.score = 0
-                self.is_in_cooldown = False
-                self.input_phase_initialized = False
-                self.esp32.send_command('X') 
-                self.game_state = self.STATE_GENERATE_SEQUENCE
-                time.sleep(0.4)
-
-        elif self.game_state == self.STATE_GENERATE_SEQUENCE:
-            all_keys = list(self.COLORS_MAP.keys())
-            self.target_sequence = [random.choice(all_keys) for _ in range(self.max_score)]
-            print(f"[GAME] Target Sequence: {[self.COLORS_MAP[k]['name'] for k in self.target_sequence]}")
-            self.player_sequence = []
-            self.flash_index = 0
-            self.flash_start_time = current_time
-            self.is_blank_period = False
-            
-            score_factor = self.sleep_score / 100.0
-            self.flash_duration = 0.4 + (1.1 * score_factor)
-            self.flash_gap = 0.3 + (0.3 * score_factor)
-            self.fog_density = int((1.0 - score_factor) * 140)
-            
-            if self.sleep_score < 50:
-                self.glitch_active = True
-                self.flicker_active = True
-                self.flicker_frequency = 4 if self.sleep_score < 25 else 8
-            else:
-                self.glitch_active = False
-                self.flicker_active = False
+            if game_state == 2:
+                pressed_node = None
+                if event.key in KEY_NODE_MAP: pressed_node = KEY_NODE_MAP[event.key]
+                elif hasattr(event, 'unicode') and event.unicode in available_nodes: pressed_node = event.unicode
                 
-            self.game_state = self.STATE_FLASH_SEQUENCE
+                if pressed_node:
+                    expected_color = target_colors[player_index]
+                    actual_color = GAME_LAYOUT[pressed_node]
+                    
+                    if actual_color == expected_color and current_led_states[pressed_node] == True:
+                        print(f"🎯 MATCH! Node {pressed_node} consumed.")
+                        current_led_states[pressed_node] = False
+                        send_led_command(ser, pressed_node, 'X')
+                        
+                        if universe_mode == "SLEEP_DEBT":
+                            mutation_color = random.choice(['RED', 'WHITE'])
+                            GAME_LAYOUT[pressed_node] = mutation_color
+                            current_led_states[pressed_node] = True
+                            print(f"⚠️ MUTATION! Node {pressed_node} mutated into Overload Color: {mutation_color}")
+                            send_led_command(ser, pressed_node, mutation_color[0])
+                        
+                        player_index += 1
+                        if player_index >= len(target_colors):
+                            game_state = 3 
+                            global_hardware_reset(ser)
+                    else:
+                        print("❌ LAPSE! Brain fatigue limit reached. Blocking hardware inputs.")
+                        game_state = 4
+                        for n in available_nodes: send_led_command(ser, n, 'R')
 
-        elif self.game_state == self.STATE_FLASH_SEQUENCE:
-            elapsed = current_time - self.flash_start_time
-            if self.flicker_active:
-                if self.frame_count % self.flicker_frequency == 0:
-                    self.current_bg = self.COLOR_BG_DISTORTED if self.current_bg == self.COLOR_BG_DEFAULT else self.COLOR_BG_DEFAULT
+    # ==========================================
+    # 🌊 高級 Apple 流體藝術渲染引擎
+    # ==========================================
+    screen.fill((10, 10, 15)) # 更加極致的深邃暗夜底色
+    
+    # 1. 題目展示期：彗星尾跡流體起飛動畫 (Neuron Flight Core)
+    if game_state == 1 and is_ball_flying:
+        active_node = target_nodes[flash_idx]
+        active_color_name = target_colors[flash_idx]
+        rgb = COLOR_RGB[active_color_name]
+        target_pos = NODE_POSITIONS[active_node]
+        
+        anim_t += flight_speed
+        if anim_t >= 1.0:
+            anim_t = 1.0
+            is_ball_flying = False
+            current_led_states[active_node] = True
+            send_led_command(ser, active_node, active_color_name[0])
+            
+            time.sleep(0.25) # 更輕柔的接棒喘息時間
+            flash_idx += 1
+            if flash_idx < len(target_colors):
+                anim_t = 0.0
+                is_ball_flying = True
+                ball_history.clear()
             else:
-                self.current_bg = self.COLOR_BG_DEFAULT
-
-            if self.flash_index < len(self.target_sequence):
-                if not self.is_blank_period:
-                    progress = elapsed / self.flash_duration
-                    self.center_alpha = int(math.sin(progress * math.pi) * 255)
-                    self.center_alpha = max(0, min(255, self.center_alpha))
-                    if elapsed > self.flash_duration:
-                        self.is_blank_period = True
-                        self.flash_start_time = current_time
-                        self.center_alpha = 0
-                else:
-                    self.center_alpha = 0
-                    if elapsed > self.flash_gap:
-                        self.is_blank_period = False
-                        self.flash_index += 1
-                        self.flash_start_time = current_time
-            
-            if self.flash_index >= len(self.target_sequence):
-                self.current_bg = self.COLOR_BG_DEFAULT
-                self.game_state = self.STATE_PLAYER_INPUT
-
-        elif self.game_state == self.STATE_PLAYER_INPUT:
-            if not self.input_phase_initialized:
-                self.esp32.send_command('Y') # 唰地一聲無線全亮！
-                self.input_phase_initialized = True
-
-        elif self.game_state == self.STATE_GAME_OVER:
-            if both_top_buttons_held:
-                self.a1_last_pressed_time = 0
-                self.a2_last_pressed_time = 0
-                self.game_state = self.STATE_START_SCREEN
-                time.sleep(0.4)
-
-    def draw_transparent_circle(self, color, alpha, center, radius, width=0):
-        surface = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-        pygame.draw.circle(surface, (*color, alpha), (radius, radius), radius, width)
-        self.screen.blit(surface, (center[0] - radius, center[1] - radius))
-
-    def render(self):
-        self.screen.fill(self.current_bg)
+                game_state = 2
+                player_index = 0
         
-        for key, data in self.COLORS_MAP.items():
-            pos = data["pos"]
-            rgb = data["rgb"]
-            self.draw_transparent_circle(rgb, 45, pos, 45, width=3)
-            self.draw_transparent_circle(rgb, 15, pos, 42)
-            
-        self.draw_transparent_circle((200, 200, 200), 30, (400, 300), 65, width=2)
-
-        for key, glow in self.glow_states.items():
-            if glow["alpha"] > 0 and glow["radius"] < self.max_glow_radius:
-                pos = self.COLORS_MAP[key]["pos"]
-                rgb = self.COLORS_MAP[key]["rgb"]
-                self.draw_transparent_circle(rgb, glow["alpha"], pos, glow["radius"], width=4)
-
-        if self.game_state == self.STATE_FLASH_SEQUENCE and not self.is_blank_period:
-            if self.flash_index < len(self.target_sequence):
-                active_key = self.target_sequence[self.flash_index]
-                target_rgb = self.COLORS_MAP[active_key]["rgb"]
-                self.draw_transparent_circle(target_rgb, self.center_alpha, (400, 300), 60)
-
-        txt_sleep_info = self.font_small.render(f"System Profile: Sleep Score [{self.sleep_score}]", True, (120, 120, 130))
-        self.screen.blit(txt_sleep_info, (20, 20))
+        ball_current_pos[0] = int(CENTER_CORE_POS[0] + (target_pos[0] - CENTER_CORE_POS[0]) * anim_t)
+        ball_current_pos[1] = int(CENTER_CORE_POS[1] + (target_pos[1] - CENTER_CORE_POS[1]) * anim_t)
         
-        if self.game_state == self.STATE_PLAYER_INPUT and self.is_in_cooldown:
-            txt_lock = self.font_small.render("[HARDWARE LOCKOUT - RE-ARMING PIPELINE]", True, (255, 100, 100))
-            self.screen.blit(txt_lock, (240, 540))
+        # 🌟 修正點 3：推入歷史記錄，並維持最多 8 幀的發光尾巴
+        ball_history.append(tuple(ball_current_pos))
+        if len(ball_history) > 8:
+            ball_history.pop(0)
+            
+        # 🌟 繪製絲滑流體殘影尾巴（越前面的尾巴越淡、越小）
+        for h_idx, pos in enumerate(ball_history):
+            trail_alpha = int(140 * (h_idx / len(ball_history)))
+            trail_radius = int(15 + 20 * (h_idx / len(ball_history)))
+            draw_liquid_glass_sphere(screen, pos, trail_radius, rgb, base_alpha=trail_alpha)
 
-        if self.game_state == self.STATE_START_SCREEN:
-            txt_title = self.font_large.render("Cognitive Evaluator (Wireless Standard)", True, self.COLOR_WHITE)
-            txt_prompt = self.font_small.render("Press Top-Left (A1) & Top-Right (A2) to initialize", True, self.COLOR_WHITE)
-            self.screen.blit(txt_title, (160, 220))
-            self.screen.blit(txt_prompt, (200, 320))
-            
-        elif self.game_state == self.STATE_FLASH_SEQUENCE:
-            txt_watch = self.font_large.render("Observe Sequence", True, self.COLOR_WHITE)
-            self.screen.blit(txt_watch, (280, 220))
-            
-        elif self.game_state == self.STATE_PLAYER_INPUT:
-            txt_repeat = self.font_large.render("Replicate Mapped Nodes", True, self.COLOR_WHITE)
-            txt_count = self.font_small.render(f"Progress Matrix: {len(self.player_sequence)} / {self.max_score}", True, self.COLOR_WHITE)
-            self.screen.blit(txt_repeat, (250, 220))
-            self.screen.blit(txt_count, (330, 320))
-            
-        elif self.game_state == self.STATE_GAME_OVER:
-            msg = "EVALUATION OPTIMAL" if self.score == self.max_score else "EVALUATION TERMINATED"
-            txt_status = self.font_large.render(msg, True, self.COLOR_WHITE)
-            self.screen.blit(txt_status, (240 if self.score == self.max_score else 225, 200))
-            
-        pygame.display.flip()
+        # 繪製最前端的超亮玻璃母體核心
+        draw_liquid_glass_sphere(screen, ball_current_pos, 45, rgb, base_alpha=220)
+        draw_liquid_glass_sphere(screen, ball_current_pos, 22, (255, 255, 255), base_alpha=180)
 
-    def cleanup(self):
-        self.esp32.close()
-        pygame.quit()
+    # 2. 渲染中央神經元母體晶體 (Apple 玻璃核心)
+    core_color = (20, 22, 32)
+    core_text = "READY"
+    if game_state == 0:
+        # IDLE 階段：溫和的科技微光呼吸
+        glow_radius = int(65 + pulse_factor * 12)
+        draw_liquid_glass_sphere(screen, CENTER_CORE_POS, glow_radius, (110, 130, 180), base_alpha=50)
+    elif game_state == 1:
+        core_text = "" 
+    elif game_state == 2:
+        core_color = (35, 40, 55)
+        core_text = "INPUT NOW"
+        draw_liquid_glass_sphere(screen, CENTER_CORE_POS, int(70 + pulse_factor * 6), (0, 180, 255), base_alpha=40)
+    elif game_state == 3:
+        core_color = (15, 80, 35)
+        core_text = "PASS"
+        draw_liquid_glass_sphere(screen, CENTER_CORE_POS, 100, COLOR_RGB['GREEN'], base_alpha=120)
+    elif game_state == 4:
+        core_color = (110, 15, 15)
+        core_text = "LAPSE"
+        draw_liquid_glass_sphere(screen, CENTER_CORE_POS, 130, COLOR_RGB['RED'], base_alpha=180)
 
-if __name__ == "__main__":
-    game = MemoryGame()
-    game.run()
+    # 繪製中央實體流體玻璃外框
+    pygame.draw.circle(screen, core_color, CENTER_CORE_POS, 55)
+    pygame.draw.circle(screen, (160, 175, 210), CENTER_CORE_POS, 57, 2) 
+    
+    if core_text != "":
+        text_surface = font_core.render(core_text, True, (230, 235, 255))
+        screen.blit(text_surface, (CENTER_CORE_POS[0] - text_surface.get_width()//2, CENTER_CORE_POS[1] - 11))
+
+    # 3. 虛擬神經元外圍圈圈渲染
+    for node, pos in NODE_POSITIONS.items():
+        if game_state == 0:
+            c_name = GAME_LAYOUT[node]
+            draw_liquid_glass_sphere(screen, pos, 32, COLOR_RGB[c_name], base_alpha=65)
+            pygame.draw.circle(screen, (60, 65, 85), pos, 34, 1)
+        elif game_state == 2 and current_led_states[node]:
+            c_name = GAME_LAYOUT[node]
+            draw_liquid_glass_sphere(screen, pos, 38, COLOR_RGB[c_name], base_alpha=140)
+            pygame.draw.circle(screen, (220, 230, 255), pos, 38, 2)
+        else:
+            pygame.draw.circle(screen, (30, 30, 40), pos, 25, 1)
+            
+        screen.blit(font_sub.render(node, True, (110, 110, 140)), (pos[0]-12, pos[1]-10))
+
+    # 4. 頂層高階遮罩：大腦睡眠黑霧面紗
+    if fog_alpha > 0 and game_state != 3:
+        fog_surface = pygame.Surface(size, pygame.SRCALPHA)
+        fog_surface.fill((8, 10, 22, fog_alpha)) 
+        screen.blit(fog_surface, (0, 0))
+
+    # 5. 文字 UI 指標渲染
+    screen.blit(font_large.render("Adaptive Cognitive Evaluator", True, (215, 220, 245)), (50, 25))
+    info_str = f"Universe: {universe_mode} | Sequence: {len(target_colors)} Steps"
+    screen.blit(font_sub.render(info_str, True, (110, 110, 135)), (50, 75))
+    if game_state == 2:
+        progress_text = font_large.render(f"Progress Matrix: {player_index} / {len(target_colors)}", True, (255, 255, 255))
+        screen.blit(progress_text, (240, 675))
+
+    if game_state == 4:
+        fail_overlay = pygame.Surface(size, pygame.SRCALPHA)
+        fail_overlay.fill((230, 0, 30, int(35 + pulse_factor * 25)))
+        screen.blit(fail_overlay, (0, 0))
+
+    pygame.display.flip()
+    clock.tick(60)
+
+global_hardware_reset(ser)
+if ser and ser.is_open: ser.close()
+pygame.quit()
+sys.exit()

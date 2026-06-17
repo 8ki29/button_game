@@ -1,5 +1,5 @@
 // ==========================================
-// Board 2: LED Driver MCU (Handshake & Core v3.3.8)
+// Board 2: AnalogWrite Matrix Decoder (v10.0.0)
 // ==========================================
 #include <esp_now.h>
 #include <WiFi.h>
@@ -7,95 +7,59 @@
 
 struct RGBLed { int redPin; int greenPin; int bluePin; };
 
-// Version 2.3 黃金配置
 RGBLed leds[6] = {
-    {4,  2,  15}, {13, 12, 14}, {5,  17, 16}, 
-    {27, 26, 25}, {21, 19, 18}, {33, 32, 23} 
+    {4,  2,  15}, // [0] A1
+    {13, 12, 14}, // [1] A2
+    {5,  17, 16}, // [2] B1 🌟 獨立正宮
+    {27, 26, 25}, // [3] B2
+    {21, 19, 18}, // [4] C1
+    {0,  0,  0 }  // [5] C2 留空 (在 Board 1)
 };
 
-// 【回傳指定】Board 1 的 MAC 位址，讓 B2 開機可以主動敲門
-uint8_t b1Address[] = {0x70, 0x4B, 0xCA, 0x49, 0x5A, 0x48};
-
-void setNodeColor(int index, bool r, bool g, bool b) {
-    digitalWrite(leds[index].redPin,   r ? HIGH : LOW);
-    digitalWrite(leds[index].greenPin, g ? HIGH : LOW);
-    digitalWrite(leds[index].bluePin,  b ? HIGH : LOW);
+void setNodePWMColor(int index, int r, int g, int b) {
+    if (index == 5) return;
+    analogWrite(leds[index].redPin,   r);
+    analogWrite(leds[index].greenPin, g);
+    analogWrite(leds[index].bluePin,  b);
 }
 
 void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-    if (len > 0) {
-        char cmd = (char)incomingData[0];
+    if (len == 2) {
+        char node = (char)incomingData[0];
+        char color = (char)incomingData[1];
         
-        // 如果收到 B1 的回應
-        if (cmd == 'H') {
-            Serial.println("\n=========================================");
-            Serial.println("🤝 [LINK SUCCESS] Board 1 has acknowledged Board 2!");
-            Serial.println("=========================================\n");
+        if (node == 'X' && color == 'X') {
+            for(int i=0; i<5; i++) setNodePWMColor(i, 0, 0, 0);
             return;
         }
         
-        // 原本的燈光遊戲解碼邏輯
-        switch (cmd) {
-            case 'X': for(int i=0; i<6; i++) setNodeColor(i, false, false, false); break;
-            case 'Y': 
-                setNodeColor(0, true,  false, true);  setNodeColor(1, true,  true,  false);
-                setNodeColor(2, false, true,  false); setNodeColor(3, false, false, true); 
-                setNodeColor(4, true,  false, false); setNodeColor(5, true,  true,  true);  
-                break;
-            case '0': setNodeColor(0, false, false, false); break;
-            case '2': setNodeColor(1, false, false, false); break;
-            case '4': setNodeColor(2, false, false, false); break;
-            case '6': setNodeColor(3, false, false, false); break;
-            case '8': setNodeColor(4, false, false, false); break;
-            case 'A': setNodeColor(5, false, false, false); break;
-            case '1': setNodeColor(0, true,  false, true);  break;
-            case '3': setNodeColor(1, true,  true,  false); break;
-            case '5': setNodeColor(2, false, true,  false); break;
-            case '7': setNodeColor(3, false, false, true);  break;
-            case '9': setNodeColor(4, true,  false, false); break;
-            case 'B': setNodeColor(5, true,  true,  true);  break;
+        int idx = node - '0'; 
+        if (idx >= 0 && idx <= 4) {
+            if (color == 'X') setNodePWMColor(idx, 0, 0, 0);
+            else if (color == 'P') setNodePWMColor(idx, 255, 0,   255); // 紫
+            else if (color == 'Y') setNodePWMColor(idx, 255, 255, 0);   // 黃
+            else if (color == 'G') setNodePWMColor(idx, 0,   255, 0);   // 綠
+            else if (color == 'B') setNodePWMColor(idx, 0,   0,   255); // 藍
+            else if (color == 'R') setNodePWMColor(idx, 255, 0,   0);   // 紅
+            else if (color == 'W') setNodePWMColor(idx, 255, 255, 255); // 白
         }
     }
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(500);
-    
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-
+    WiFi.mode(WIFI_STA); WiFi.disconnect();
     esp_wifi_set_promiscuous(true);
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_promiscuous(false);
 
-    if (esp_now_init() != ESP_OK) {
-        return;
-    }
-    
+    if (esp_now_init() != ESP_OK) return;
     esp_now_register_recv_cb(OnDataRecv);
 
-    // 讓 B2 也能主動發報給 B1
-    esp_now_peer_info_t peerInfo;
-    memset(&peerInfo, 0, sizeof(peerInfo));
-    memcpy(peerInfo.peer_addr, b1Address, 6);
-    peerInfo.channel = 1;
-    peerInfo.encrypt = false;
-    peerInfo.ifidx = WIFI_IF_STA;
-    esp_now_add_peer(&peerInfo);
-
-    for (int i = 0; i < 6; i++) {
-        pinMode(leds[i].redPin, OUTPUT); pinMode(leds[i].greenPin, OUTPUT); pinMode(leds[i].bluePin, OUTPUT);
-        setNodeColor(i, false, false, false);
+    for (int i = 0; i < 5; i++) {
+        pinMode(leds[i].redPin, OUTPUT); 
+        pinMode(leds[i].greenPin, OUTPUT); 
+        pinMode(leds[i].bluePin, OUTPUT);
+        setNodePWMColor(i, 0, 0, 0); 
     }
-    
-    Serial.println("[SYS] Board 2 Online. Sending handshake token to Board 1...");
-    
-    // 【核心魔法】開機立刻大喊一聲 'H' 向 B1 報到！
-    char handshake = 'H';
-    esp_now_send(b1Address, (uint8_t *) &handshake, sizeof(handshake));
 }
-
-void loop() {
-    delay(50); 
-}
+void loop() { delay(10); }
